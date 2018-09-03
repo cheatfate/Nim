@@ -108,6 +108,7 @@ const
   NORMAL_PRIORITY_CLASS* = 32'i32
   REALTIME_PRIORITY_CLASS* = 256'i32
   WAIT_OBJECT_0* = 0'i32
+  WAIT_ABANDONED_0* = 0x80'i32
   WAIT_TIMEOUT* = 0x00000102'i32
   WAIT_FAILED* = 0xFFFFFFFF'i32
   INFINITE* = -1'i32
@@ -128,6 +129,10 @@ const
   PIPE_ACCESS_INBOUND* = 1'i32
   PIPE_ACCESS_OUTBOUND* = 2'i32
   PIPE_NOWAIT* = 0x00000001'i32
+  PIPE_WAIT* = 0x00000000'i32
+  PIPE_TYPE_BYTE* = 0x00000000'i32
+  PIPE_READMODE_BYTE* = 0x00000000'i32
+
   SYNCHRONIZE* = 0x00100000'i32
 
   CREATE_NO_WINDOW* = 0x08000000'i32
@@ -711,6 +716,7 @@ const
   ERROR_LOCK_VIOLATION* = 33
   ERROR_HANDLE_EOF* = 38
   ERROR_BAD_ARGUMENTS* = 165
+  ERROR_BROKEN_PIPE* = 109
 
 proc duplicateHandle*(hSourceProcessHandle: HANDLE, hSourceHandle: HANDLE,
                       hTargetProcessHandle: HANDLE,
@@ -1044,6 +1050,9 @@ else:
 proc setEvent*(hEvent: Handle): cint
      {.stdcall, dynlib: "kernel32", importc: "SetEvent".}
 
+proc resetEvent*(hEvent: Handle): cint
+     {.stdcall, dynlib: "kernel32", importc: "ResetEvent".}
+
 const
   FD_READ* = 0x00000001'i32
   FD_WRITE* = 0x00000002'i32
@@ -1113,3 +1122,6 @@ type
 proc setFileTime*(hFile: HANDLE, lpCreationTime: LPFILETIME,
                  lpLastAccessTime: LPFILETIME, lpLastWriteTime: LPFILETIME): WINBOOL
      {.stdcall, dynlib: "kernel32", importc: "SetFileTime".}
+
+proc queryPerformanceCounter*(res: var int64)
+       {.importc: "QueryPerformanceCounter", stdcall, dynlib: "kernel32".}

@@ -40,9 +40,10 @@ type
                          ## UI applications. Currently this only affects
                          ## Windows: Named pipes are used so that you can peek
                          ## at the process' output streams.
-    poDemon              ## Windows: The program creates no Window.
+    poDemon,             ## Windows: The program creates no Window.
                          ## Unix: Start the program as a demon. This is still
                          ## work in progress!
+    poAsync              ## Internal flag for `execProcesses` usage.
 
   ProcessObj = object of RootObj
     when defined(windows):
@@ -52,8 +53,8 @@ type
       id: Handle
     else:
       inHandle, outHandle, errHandle: FileHandle
-      inStream, outStream, errStream: Stream
       id: Pid
+    inStream, outStream, errStream: Stream
     exitStatus: cint
     exitFlag: bool
     options: set[ProcessOption]
@@ -68,11 +69,11 @@ proc execProcess*(command: string,
                   args: openArray[string] = [],
                   env: StringTableRef = nil,
                   options: set[ProcessOption] = {poStdErrToStdOut,
-                                                  poUsePath,
-                                                  poEvalCommand}): TaintedString {.
-                                                  rtl, extern: "nosp$1",
-                                                  tags: [ExecIOEffect, ReadIOEffect,
-                                                  RootEffect].}
+                                                 poUsePath,
+                                                 poEvalCommand}): TaintedString {.
+                                                 rtl, extern: "nosp$1",
+                                                 tags: [ExecIOEffect, ReadIOEffect,
+                                                 RootEffect].}
   ## A convenience procedure that executes ``command`` with ``startProcess``
   ## and returns its output as a string.
   ## WARNING: this function uses poEvalCommand by default for backward compatibility.
@@ -221,59 +222,235 @@ proc countProcessors*(): int {.rtl, extern: "nosp$1".} =
   ## Returns 0 if it cannot be detected.
   result = cpuinfo.countProcessors()
 
-proc execProcesses*(cmds: openArray[string],
-                    options = {poStdErrToStdOut, poParentStreams},
-                    n = countProcessors(),
-                    beforeRunEvent: proc(idx: int) = nil,
-                    afterRunEvent: proc(idx: int, p: Process) = nil): int
-                    {.rtl, extern: "nosp$1",
-                    tags: [ExecIOEffect, TimeEffect, ReadEnvEffect, RootEffect]} =
-  ## executes the commands `cmds` in parallel. Creates `n` processes
-  ## that execute in parallel. The highest return value of all processes
-  ## is returned. Runs `beforeRunEvent` before running each command.
+when defined(windows):
+  const
+    PipeBufferSize = 1024
 
-  assert n > 0
-  if n > 1:
-    var i = 0
-    var q = newSeq[Process](n)
+  type
+    BOverlapped = object of OVERLAPPED
+      buffer: array[PipeBufferSize, byte]
+      handle: Handle
+      stream: Stream
+      process: Process
+      exitflag: int
 
-    when defined(windows):
-      var w: WOHandleArray
-      var m = min(min(n, MAXIMUM_WAIT_OBJECTS), cmds.len)
-      var wcount = m
+  proc initOverlappeds(n: int): seq[BOverlapped] =
+    result = newSeq[BOverlapped](n)
+    for i in 0..<len(result):
+      result[i].hEvent = createEvent(nil, 1, 0, nil)
+    GC_ref(result)
+
+  proc clear(ovls: var seq[BOverlapped]) =
+    for i in 0..<len(ovls):
+      discard closeHandle(ovls[i].hEvent)
+    GC_unref(ovls)
+
+  proc startRead*(os: var seq[BOverlapped], index: int) =
+    let ret = readFile(os[index].handle,
+                       cast[pointer](addr os[index].buffer[0]),
+                       PipeBufferSize,
+                       nil, cast[ptr OVERLAPPED](addr os[index]))
+    if ret == 0:
+      let err = osLastError()
+      if int(err) == ERROR_BROKEN_PIPE:
+        # Process is already exited, we need to set OVERLAPPED
+        # event manually.
+        discard winlean.setEvent(os[index].hEvent)
+      elif int(err) == ERROR_IO_PENDING:
+        # Read operation pending 
+        discard
+      else:
+        raiseOSError(err)
+
+  proc finishRead*(os: var seq[BOverlapped], index: int): bool =
+    var size: int32
+    result = true
+    if getOverlappedResult(os[index].handle,
+                           cast[ptr OVERLAPPED](addr os[index]),
+                           size, WINBOOL(0)) == 0:
+      result = false
+    # Reset event to non-active state.
+    discard resetEvent(os[index].hEvent)
+    os[index].internal = cast[PULONG](0)
+    os[index].internalHigh = cast[PULONG](0)
+    os[index].offset = DWORD(0)
+    os[index].offsetHigh = DWORD(0)
+    if size != 0:
+      os[index].stream.writeData(cast[pointer](addr os[index].buffer[0]), size)
     else:
-      var m = min(n, cmds.len)
+      result = false
 
-    while i < m:
-      if beforeRunEvent != nil:
-        beforeRunEvent(i)
-      q[i] = startProcess(cmds[i], options = options + {poEvalCommand})
-      when defined(windows):
-        w[i] = q[i].fProcessHandle
+  template setupProcess(cmds, queue, options, oos, eos, whandles,
+                        index, waitpos, cmdid) =
+    queue[index] = startProcess(cmds[cmdid],
+                                options = options + {poEvalCommand, poAsync})
+    queue[index].outStream = newStringStream()
+    oos[index].handle = queue[index].outHandle
+    oos[index].process = queue[index]
+    oos[index].stream = queue[index].outStream
+    startRead(oos, index)
+    if poStdErrToStdOut in options:
+      queue[index].errStream = queue[index].outStream
+    else:
+      eos[index].handle = queue[index].errHandle
+      eos[index].process = queue[index]
+      queue[index].errStream = newStringStream()
+      eos[index].stream = queue[index].errStream
+      startRead(eos, index)
+
+  proc execProcesses*(cmds: openArray[string],
+                      options = {poStdErrToStdOut, poParentStreams},
+                      n = countProcessors(),
+                      beforeRunEvent: proc(idx: int) = nil,
+                      afterRunEvent: proc(idx: int, p: Process) = nil): int
+                      {.rtl, extern: "nosp$1",
+                      tags: [ExecIOEffect, TimeEffect, ReadEnvEffect, RootEffect]} =
+    assert n > 0
+    var eos, oos: seq[BOverlapped]
+    var queue = newSeq[Process](n)
+    var processes = newSeq[Process](n)
+    var waitHandles: WOHandleArray
+    var waitCount: int32
+    var maxHandles: int
+    var rexit = -1
+
+    if poStdErrToStdOut in options:
+      maxHandles = min(min(n, MAXIMUM_WAIT_OBJECTS), len(cmds))
+      waitCount = int32(maxHandles)
+      oos = initOverlappeds(maxHandles)
+    else:
+      maxHandles = min(min(n, MAXIMUM_WAIT_OBJECTS div 2), len(cmds))
+      waitCount = int32(maxHandles * 2)
+      eos = initOverlappeds(maxHandles)
+      oos = initOverlappeds(maxHandles)
+
+    var i = 0
+    while i < maxHandles:
+      if not isNil(beforeRunEvent): beforeRunEvent(i)
+      setupProcess(cmds, queue, options, oos, eos, waitHandles, i, i, i)
+      if poStdErrToStdOut in options:
+        waitHandles[i] = oos[i].hEvent
+      else:
+        let pos = i shl 1
+        waitHandles[pos] = oos[i].hEvent
+        waitHandles[pos + 1] = eos[i].hEvent
       inc(i)
 
     var ecount = len(cmds)
     while ecount > 0:
-      var rexit = -1
-      when defined(windows):
-        # waiting for all children, get result if any child exits
-        var ret = waitForMultipleObjects(int32(wcount), addr(w), 0'i32,
-                                         INFINITE)
-        if ret == WAIT_TIMEOUT:
-          # must not be happen
-          discard
-        elif ret == WAIT_FAILED:
-          raiseOSError(osLastError())
-        else:
-          var status: int32
-          for r in 0..m-1:
-            if not isNil(q[r]) and q[r].fProcessHandle == w[ret]:
-              discard getExitCodeProcess(q[r].fProcessHandle, status)
-              q[r].exitFlag = true
-              q[r].exitStatus = status
-              rexit = r
-              break
+      var ret = waitForMultipleObjects(waitCount, addr(waitHandles), 0'i32,
+                                       INFINITE)
+      if ret == WAIT_TIMEOUT:
+        # must not be happen
+        discard
+      elif ret == WAIT_FAILED:
+        raiseOSError(osLastError())
       else:
+        if ret >= WAIT_ABANDONED_0:
+          ret -= WAIT_ABANDONED_0
+
+        var exithandle: Handle
+        var markhandle: Handle
+        if poStdErrToStdOut in options:
+          for r in 0..<maxHandles:
+            if oos[r].hEvent == waitHandles[ret]:
+              if oos.finishRead(r):
+                oos.startRead(r)
+              else:
+                exithandle = oos[r].process.fProcessHandle
+                rexit = r
+              break
+        else:
+          for r in 0..<maxHandles:
+            if oos[r].hEvent == waitHandles[ret]:
+              if oos.finishRead(r):
+                oos.startRead(r)
+              else:
+                if oos[r].exitflag == 1:
+                  exithandle = oos[r].process.fProcessHandle
+                  rexit = r
+                else:
+                  # This is trick because `stderr` read is still pending.
+                  # We set `exitflag` for `stderr` handler.
+                  eos[r].exitflag = 1
+              break
+            elif eos[r].hEvent == waitHandles[ret]:
+              if eos.finishRead(r):
+                eos.startRead(r)
+              else:
+                if eos[r].exitFlag == 1:
+                  exithandle = eos[r].process.fProcessHandle
+                  rexit = r
+                else:
+                  # This is trick because `stdout` read is still pending.
+                  # We set `exitflag` for `stdout` handler.
+                  oos[r].exitflag = 1
+              break
+
+      if rexit >= 0:
+        var status: int32
+        discard getExitCodeProcess(queue[rexit].fProcessHandle, status)
+        queue[rexit].exitFlag = true
+        queue[rexit].exitStatus = status
+        # Set streams position to beginning
+        queue[rexit].outStream.setPosition(0)
+        if poStdErrToStdOut notin options:
+          queue[rexit].errStream.setPosition(0)
+        result = max(result, abs(queue[rexit].peekExitCode()))
+        if afterRunEvent != nil: afterRunEvent(rexit, queue[rexit])
+        close(queue[rexit])
+
+        if i < len(cmds):
+          if beforeRunEvent != nil: beforeRunEvent(i)
+          setupProcess(cmds, queue, options, oos, eos, waitHandles,
+                       rexit, ret, i)
+          inc(i)
+        else:
+          if poStdErrToStdOut in options:
+            let lastOne = waitCount - 1
+            waitHandles[ret] = waitHandles[lastOne]
+            waitCount -= 1
+          else:
+            let lastOne = waitCount - 2
+            let pos = (ret shr 1) shl 1
+            waitHandles[pos] = waitHandles[lastOne]
+            waitHandles[pos + 1] = waitHandles[lastOne + 1]
+            waitCount -= 2
+          queue[rexit] = nil
+        rexit = -1
+        dec(ecount)
+
+    # We need to clean `BOverlapped` sequences.
+    oos.clear()
+    if poStdErrToStdOut notin options:
+      eos.clear()
+else:
+  proc execProcesses*(cmds: openArray[string],
+                      options = {poStdErrToStdOut, poParentStreams},
+                      n = countProcessors(),
+                      beforeRunEvent: proc(idx: int) = nil,
+                      afterRunEvent: proc(idx: int, p: Process) = nil): int
+                      {.rtl, extern: "nosp$1",
+                      tags: [ExecIOEffect, TimeEffect, ReadEnvEffect, RootEffect]} =
+    ## executes the commands `cmds` in parallel. Creates `n` processes
+    ## that execute in parallel. The highest return value of all processes
+    ## is returned. Runs `beforeRunEvent` before running each command.
+    assert n > 0
+    if n > 1:
+      var i = 0
+      var q = newSeq[Process](n)
+
+      var m = min(n, cmds.len)
+
+      while i < m:
+        if beforeRunEvent != nil:
+          beforeRunEvent(i)
+        q[i] = startProcess(cmds[i], options = options + {poEvalCommand})
+        inc(i)
+
+      var ecount = len(cmds)
+      while ecount > 0:
+        var rexit = -1
         var status: cint = 1
         # waiting for all children, get result if any child exits
         let res = waitpid(-1, status, 0)
@@ -302,35 +479,28 @@ proc execProcesses*(cmds: openArray[string],
             # all other errors are exceptions
             raiseOSError(err)
 
-      if rexit >= 0:
-        result = max(result, abs(q[rexit].peekExitCode()))
-        if afterRunEvent != nil: afterRunEvent(rexit, q[rexit])
-        close(q[rexit])
-        if i < len(cmds):
-          if beforeRunEvent != nil: beforeRunEvent(i)
-          q[rexit] = startProcess(cmds[i],
-                                  options = options + {poEvalCommand})
-          when defined(windows):
-            w[rexit] = q[rexit].fProcessHandle
-          inc(i)
-        else:
-          when defined(windows):
-            for k in 0..wcount - 1:
-              if w[k] == q[rexit].fProcessHandle:
-                w[k] = w[wcount - 1]
-                w[wcount - 1] = 0
-                dec(wcount)
-                break
-          q[rexit] = nil
-        dec(ecount)
-  else:
-    for i in 0..high(cmds):
-      if beforeRunEvent != nil:
-        beforeRunEvent(i)
-      var p = startProcess(cmds[i], options=options + {poEvalCommand})
-      result = max(abs(waitForExit(p)), result)
-      if afterRunEvent != nil: afterRunEvent(i, p)
-      close(p)
+        if rexit >= 0:
+          result = max(result, abs(q[rexit].peekExitCode()))
+          if afterRunEvent != nil: afterRunEvent(rexit, q[rexit])
+          close(q[rexit])
+          if i < len(cmds):
+            if beforeRunEvent != nil: beforeRunEvent(i)
+            q[rexit] = startProcess(cmds[i],
+                                    options = options + {poEvalCommand})
+            when defined(windows):
+              w[rexit] = q[rexit].fProcessHandle
+            inc(i)
+          else:
+            q[rexit] = nil
+          dec(ecount)
+    else:
+      for i in 0..high(cmds):
+        if beforeRunEvent != nil:
+          beforeRunEvent(i)
+        var p = startProcess(cmds[i], options=options + {poEvalCommand})
+        result = max(abs(waitForExit(p)), result)
+        if afterRunEvent != nil: afterRunEvent(i, p)
+        close(p)
 
 proc select*(readfds: var seq[Process], timeout = 500): int
   {.benign, deprecated.}
@@ -447,7 +617,7 @@ when defined(Windows) and not defined(useNimRtl):
       dwOpenMode=PIPE_ACCESS_INBOUND or FILE_FLAG_WRITE_THROUGH,
       dwPipeMode=PIPE_NOWAIT,
       nMaxInstances=1,
-      nOutBufferSize=1024, nInBufferSize=1024,
+      nOutBufferSize = PipeBufferSize, nInBufferSize = PipeBufferSize,
       nDefaultTimeOut=0,addr sa)
     if pipeOut == INVALID_HANDLE_VALUE:
       raiseOSError(osLastError())
@@ -455,7 +625,7 @@ when defined(Windows) and not defined(useNimRtl):
       dwOpenMode=PIPE_ACCESS_OUTBOUND or FILE_FLAG_WRITE_THROUGH,
       dwPipeMode=PIPE_NOWAIT,
       nMaxInstances=1,
-      nOutBufferSize=1024, nInBufferSize=1024,
+      nOutBufferSize = PipeBufferSize, nInBufferSize = PipeBufferSize,
       nDefaultTimeOut=0,addr sa)
     if pipeIn == INVALID_HANDLE_VALUE:
       raiseOSError(osLastError())
@@ -483,13 +653,35 @@ when defined(Windows) and not defined(useNimRtl):
     discard closeHandle(pipeIn)
     discard closeHandle(pipeOut)
     stderr = stdout
-
-  proc createPipeHandles(rdHandle, wrHandle: var Handle) =
+  
+  proc createPipeHandles(rdHandle, wrHandle: var Handle,
+                         flags: set[ProcessOption]) =
     var sa: SECURITY_ATTRIBUTES
     sa.nLength = sizeof(SECURITY_ATTRIBUTES).cint
     sa.lpSecurityDescriptor = nil
     sa.bInheritHandle = 1
-    if createPipe(rdHandle, wrHandle, sa, 0) == 0'i32:
+    var hash: int64
+    queryPerformanceCounter(hash)
+    let pipeName = newWideCString(r"\\.\pipe\nimpipe." & $hash)
+    var openMode = FILE_FLAG_FIRST_PIPE_INSTANCE or PIPE_ACCESS_INBOUND or
+                   FILE_FLAG_WRITE_THROUGH
+    if poAsync in flags:
+      openMode = openMode or FILE_FLAG_OVERLAPPED
+    let pipeMode = PIPE_TYPE_BYTE or PIPE_READMODE_BYTE or PIPE_WAIT
+    rdHandle = createNamedPipe(pipeName, dwOpenMode = openMode,
+                               dwPipeMode = pipeMode, nMaxInstances = 1,
+                               nOutBufferSize = PipeBufferSize,
+                               nInBufferSize = PipeBufferSize,
+                               nDefaultTimeOut = 0, addr sa)
+    if rdHandle == INVALID_HANDLE_VALUE:
+      raiseOSError(osLastError())
+
+    wrHandle = createFileW(pipeName, FILE_WRITE_DATA or SYNCHRONIZE, 0,
+                           addr sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                           0)
+    if wrHandle == INVALID_HANDLE_VALUE:
+      discard closeHandle(rdHandle)
+      rdHandle = Handle(INVALID_HANDLE_VALUE)
       raiseOSError(osLastError())
 
   proc fileClose(h: Handle) {.inline.} =
@@ -512,13 +704,13 @@ when defined(Windows) and not defined(useNimRtl):
     if poParentStreams notin options:
       si.dwFlags = STARTF_USESTDHANDLES # STARTF_USESHOWWINDOW or
       if poInteractive notin options:
-        createPipeHandles(si.hStdInput, hi)
-        createPipeHandles(ho, si.hStdOutput)
+        createPipeHandles(si.hStdInput, hi, options)
+        createPipeHandles(ho, si.hStdOutput, options)
         if poStdErrToStdOut in options:
           si.hStdError = si.hStdOutput
           he = ho
         else:
-          createPipeHandles(he, si.hStdError)
+          createPipeHandles(he, si.hStdError, options)
           if setHandleInformation(he, DWORD(1), DWORD(0)) == 0'i32:
             raiseOsError(osLastError())
         if setHandleInformation(hi, DWORD(1), DWORD(0)) == 0'i32:
@@ -650,15 +842,21 @@ when defined(Windows) and not defined(useNimRtl):
 
   proc inputStream(p: Process): Stream =
     streamAccess(p)
-    result = newFileHandleStream(p.inHandle)
+    if p.inStream == nil:
+      p.inStream = newFileHandleStream(p.inHandle)
+    return p.inStream
 
   proc outputStream(p: Process): Stream =
     streamAccess(p)
-    result = newFileHandleStream(p.outHandle)
+    if p.outStream == nil:
+      p.outStream = newFileHandleStream(p.outHandle)
+    return p.outStream
 
   proc errorStream(p: Process): Stream =
     streamAccess(p)
-    result = newFileHandleStream(p.errHandle)
+    if p.errStream == nil:
+      p.errStream = newFileHandleStream(p.errHandle)
+    return p.errStream
 
   proc execCmd(command: string): int =
     var
