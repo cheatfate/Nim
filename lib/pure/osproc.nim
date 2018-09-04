@@ -248,8 +248,8 @@ when defined(windows):
   proc startRead*(os: var seq[BOverlapped], index: int) =
     let ret = readFile(os[index].handle,
                        cast[pointer](addr os[index].buffer[0]),
-                       PipeBufferSize,
-                       nil, cast[ptr OVERLAPPED](addr os[index]))
+                       PipeBufferSize, nil,
+                       cast[ptr OVERLAPPED](addr os[index]))
     if ret == 0:
       let err = osLastError()
       if int(err) == ERROR_BROKEN_PIPE:
@@ -282,21 +282,27 @@ when defined(windows):
 
   template setupProcess(cmds, queue, options, oos, eos, whandles,
                         index, waitpos, cmdid) =
-    queue[index] = startProcess(cmds[cmdid],
-                                options = options + {poEvalCommand, poAsync})
-    queue[index].outStream = newStringStream()
-    oos[index].handle = queue[index].outHandle
-    oos[index].process = queue[index]
-    oos[index].stream = queue[index].outStream
-    startRead(oos, index)
-    if poStdErrToStdOut in options:
-      queue[index].errStream = queue[index].outStream
+    if poParentStreams in options:
+      queue[index] = startProcess(cmds[cmdid],
+                                  options = options + {poEvalCommand})
     else:
-      eos[index].handle = queue[index].errHandle
-      eos[index].process = queue[index]
-      queue[index].errStream = newStringStream()
-      eos[index].stream = queue[index].errStream
-      startRead(eos, index)
+      queue[index] = startProcess(cmds[cmdid],
+                                  options = options + {poEvalCommand, poAsync})
+
+    if poParentStreams notin options:
+      queue[index].outStream = newStringStream()
+      oos[index].handle = queue[index].outHandle
+      oos[index].process = queue[index]
+      oos[index].stream = queue[index].outStream
+      startRead(oos, index)
+      if poStdErrToStdOut in options:
+        queue[index].errStream = queue[index].outStream
+      else:
+        eos[index].handle = queue[index].errHandle
+        eos[index].process = queue[index]
+        queue[index].errStream = newStringStream()
+        eos[index].stream = queue[index].errStream
+        startRead(eos, index)
 
   proc execProcesses*(cmds: openArray[string],
                       options = {poStdErrToStdOut, poParentStreams},
@@ -314,26 +320,33 @@ when defined(windows):
     var maxHandles: int
     var rexit = -1
 
-    if poStdErrToStdOut in options:
+    if poParentStreams in options:
       maxHandles = min(min(n, MAXIMUM_WAIT_OBJECTS), len(cmds))
       waitCount = int32(maxHandles)
-      oos = initOverlappeds(maxHandles)
     else:
-      maxHandles = min(min(n, MAXIMUM_WAIT_OBJECTS div 2), len(cmds))
-      waitCount = int32(maxHandles * 2)
-      eos = initOverlappeds(maxHandles)
-      oos = initOverlappeds(maxHandles)
+      if poStdErrToStdOut in options:
+        maxHandles = min(min(n, MAXIMUM_WAIT_OBJECTS), len(cmds))
+        waitCount = int32(maxHandles)
+        oos = initOverlappeds(maxHandles)
+      else:
+        maxHandles = min(min(n, MAXIMUM_WAIT_OBJECTS div 2), len(cmds))
+        waitCount = int32(maxHandles * 2)
+        eos = initOverlappeds(maxHandles)
+        oos = initOverlappeds(maxHandles)
 
     var i = 0
     while i < maxHandles:
       if not isNil(beforeRunEvent): beforeRunEvent(i)
       setupProcess(cmds, queue, options, oos, eos, waitHandles, i, i, i)
-      if poStdErrToStdOut in options:
-        waitHandles[i] = oos[i].hEvent
+      if poParentStreams in options:
+        waitHandles[i] = queue[i].fProcessHandle
       else:
-        let pos = i shl 1
-        waitHandles[pos] = oos[i].hEvent
-        waitHandles[pos + 1] = eos[i].hEvent
+        if poStdErrToStdOut in options:
+          waitHandles[i] = oos[i].hEvent
+        else:
+          let pos = i shl 1
+          waitHandles[pos] = oos[i].hEvent
+          waitHandles[pos + 1] = eos[i].hEvent
       inc(i)
 
     var ecount = len(cmds)
@@ -349,53 +362,55 @@ when defined(windows):
         if ret >= WAIT_ABANDONED_0:
           ret -= WAIT_ABANDONED_0
 
-        var exithandle: Handle
-        var markhandle: Handle
-        if poStdErrToStdOut in options:
+        if poParentStreams in options:
           for r in 0..<maxHandles:
-            if oos[r].hEvent == waitHandles[ret]:
-              if oos.finishRead(r):
-                oos.startRead(r)
-              else:
-                exithandle = oos[r].process.fProcessHandle
-                rexit = r
+            if queue[r].fProcessHandle == waitHandles[ret]:
+              rexit = r
               break
         else:
-          for r in 0..<maxHandles:
-            if oos[r].hEvent == waitHandles[ret]:
-              if oos.finishRead(r):
-                oos.startRead(r)
-              else:
-                if oos[r].exitflag == 1:
-                  exithandle = oos[r].process.fProcessHandle
-                  rexit = r
+          if poStdErrToStdOut in options:
+            for r in 0..<maxHandles:
+              if oos[r].hEvent == waitHandles[ret]:
+                if oos.finishRead(r):
+                  oos.startRead(r)
                 else:
-                  # This is trick because `stderr` read is still pending.
-                  # We set `exitflag` for `stderr` handler.
-                  eos[r].exitflag = 1
-              break
-            elif eos[r].hEvent == waitHandles[ret]:
-              if eos.finishRead(r):
-                eos.startRead(r)
-              else:
-                if eos[r].exitFlag == 1:
-                  exithandle = eos[r].process.fProcessHandle
                   rexit = r
+                break
+          else:
+            for r in 0..<maxHandles:
+              if oos[r].hEvent == waitHandles[ret]:
+                if oos.finishRead(r):
+                  oos.startRead(r)
                 else:
-                  # This is trick because `stdout` read is still pending.
-                  # We set `exitflag` for `stdout` handler.
-                  oos[r].exitflag = 1
-              break
+                  if oos[r].exitflag == 1:
+                    rexit = r
+                  else:
+                    # This is trick because `stderr` read is still pending.
+                    # We set `exitflag` for `stderr` handler.
+                    eos[r].exitflag = 1
+                break
+              elif eos[r].hEvent == waitHandles[ret]:
+                if eos.finishRead(r):
+                  eos.startRead(r)
+                else:
+                  if eos[r].exitFlag == 1:
+                    rexit = r
+                  else:
+                    # This is trick because `stdout` read is still pending.
+                    # We set `exitflag` for `stdout` handler.
+                    oos[r].exitflag = 1
+                break
 
       if rexit >= 0:
         var status: int32
         discard getExitCodeProcess(queue[rexit].fProcessHandle, status)
         queue[rexit].exitFlag = true
         queue[rexit].exitStatus = status
-        # Set streams position to beginning
-        queue[rexit].outStream.setPosition(0)
-        if poStdErrToStdOut notin options:
-          queue[rexit].errStream.setPosition(0)
+        if poParentStreams notin options:
+          # Set streams position to beginning
+          queue[rexit].outStream.setPosition(0)
+          if poStdErrToStdOut notin options:
+            queue[rexit].errStream.setPosition(0)
         result = max(result, abs(queue[rexit].peekExitCode()))
         if afterRunEvent != nil: afterRunEvent(rexit, queue[rexit])
         close(queue[rexit])
@@ -406,16 +421,19 @@ when defined(windows):
                        rexit, ret, i)
           inc(i)
         else:
-          if poStdErrToStdOut in options:
-            let lastOne = waitCount - 1
-            waitHandles[ret] = waitHandles[lastOne]
+          if poParentStreams in options:
+            waitHandles[ret] = waitHandles[waitCount - 1]
             waitCount -= 1
           else:
-            let lastOne = waitCount - 2
-            let pos = (ret shr 1) shl 1
-            waitHandles[pos] = waitHandles[lastOne]
-            waitHandles[pos + 1] = waitHandles[lastOne + 1]
-            waitCount -= 2
+            if poStdErrToStdOut in options:
+              waitHandles[ret] = waitHandles[waitCount - 1]
+              waitCount -= 1
+            else:
+              let lastOne = waitCount - 2
+              let pos = (ret shr 1) shl 1
+              waitHandles[pos] = waitHandles[lastOne]
+              waitHandles[pos + 1] = waitHandles[lastOne + 1]
+              waitCount -= 2
           queue[rexit] = nil
         rexit = -1
         dec(ecount)
@@ -662,7 +680,7 @@ when defined(Windows) and not defined(useNimRtl):
     sa.bInheritHandle = 1
     var hash: int64
     queryPerformanceCounter(hash)
-    let pipeName = newWideCString(r"\\.\pipe\nimpipe." & $hash)
+    let pipeName = newWideCString(r"\\.\pipe\LOCAL\nimpipe." & $hash)
     var openMode = FILE_FLAG_FIRST_PIPE_INSTANCE or PIPE_ACCESS_INBOUND or
                    FILE_FLAG_WRITE_THROUGH
     if poAsync in flags:
